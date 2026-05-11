@@ -1,0 +1,11 @@
+build/
+build-*/
+bin/
+vs/
+xcode/
+.DS_Store
+*.swp
+example-*/CMakePresets.json
+example-*/build/
+example-*/build-*/
+example-*/bin/

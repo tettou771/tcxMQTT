@@ -1,0 +1,95 @@
+#pragma once
+
+// =============================================================================
+// tcxMQTTClient.h - MQTT 3.1.1 client (lwmqtt + TrussC TcpClient)
+// =============================================================================
+// Two usage patterns supported:
+//   - async: register listeners on the Event<T> members (RAII, see TrussC docs)
+//   - sync : call hasNewMessage() / getNextMessage() in update()
+// They can be mixed freely. The sync queue is allocated lazily the first
+// time hasNewMessage() is called; pure async users pay no queue cost.
+
+#include "tcxMQTTMessage.h"
+#include "tc/events/tcEvent.h"
+#include "tc/events/tcEventListener.h"
+
+#include <atomic>
+#include <cstdint>
+#include <memory>
+#include <string>
+
+namespace tcx {
+
+class MQTTClient {
+public:
+    // -------------------------------------------------------------------------
+    // Events (async pattern)
+    // -------------------------------------------------------------------------
+    ::trussc::Event<MQTTMessage> onMessage;       // Published message arrived
+    ::trussc::Event<void>        onConnect;       // CONNACK accepted
+    ::trussc::Event<void>        onDisconnect;    // Socket closed / lost
+    ::trussc::Event<std::string> onError;         // Protocol or transport error
+
+    // -------------------------------------------------------------------------
+    // Lifecycle
+    // -------------------------------------------------------------------------
+    MQTTClient();
+    ~MQTTClient();
+
+    MQTTClient(const MQTTClient&) = delete;
+    MQTTClient& operator=(const MQTTClient&) = delete;
+
+    // Connect to broker. Blocks until CONNACK or timeout (default 5s).
+    // clientId empty -> auto-generated. username empty -> anonymous.
+    bool connect(const std::string& host, int port,
+                 const std::string& clientId = "",
+                 const std::string& username = "",
+                 const std::string& password = "",
+                 int timeoutMs = 5000);
+
+    // Tear down connection. Safe to call multiple times.
+    void disconnect();
+
+    bool isConnected() const;
+
+    // -------------------------------------------------------------------------
+    // Pub/Sub
+    // -------------------------------------------------------------------------
+    bool subscribe(const std::string& topic, int qos = 0);
+    bool unsubscribe(const std::string& topic);
+
+    bool publish(const std::string& topic,
+                 const std::string& payload,
+                 int qos = 0, bool retain = false);
+
+    bool publish(const std::string& topic,
+                 const uint8_t* data, size_t len,
+                 int qos = 0, bool retain = false);
+
+    // -------------------------------------------------------------------------
+    // Polling — must be called regularly (typically in App::update())
+    // -------------------------------------------------------------------------
+    // Drives keep-alive PING and dispatches queued events to the main thread.
+    void update();
+
+    // -------------------------------------------------------------------------
+    // Sync polling API (buffer enabled lazily on first call)
+    // -------------------------------------------------------------------------
+    bool   hasNewMessage();
+    bool   getNextMessage(MQTTMessage& out);
+    size_t numNewMessages() const;
+    void   setBufferSize(size_t size);
+    size_t getBufferSize() const;
+
+    // -------------------------------------------------------------------------
+    // Options (call before connect)
+    // -------------------------------------------------------------------------
+    void setKeepAlive(int seconds);     // default 60
+    void setCleanSession(bool clean);   // default true
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+} // namespace tcx

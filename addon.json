@@ -1,0 +1,6 @@
+{
+  "description": "MQTT 3.1.1 client (lwmqtt + TrussC TcpClient). Sync polling and async Event<T> patterns both supported.",
+  "author": "tettou771",
+  "license": "MIT",
+  "keywords": ["mqtt", "network", "iot", "pubsub", "broker"]
+}
