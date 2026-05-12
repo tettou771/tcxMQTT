@@ -331,7 +331,7 @@ bool MQTTClient::connect(const std::string& host, int port,
     }
 
     // Build CONNECT options
-    lwmqtt_options_t opts = lwmqtt_default_options;
+    lwmqtt_connect_options_t opts = lwmqtt_default_connect_options;
     std::string cid = clientId;
     if (cid.empty()) {
         // Generate a small random suffix
@@ -355,12 +355,12 @@ bool MQTTClient::connect(const std::string& host, int port,
         }
     }
 
-    lwmqtt_return_code_t rc = LWMQTT_UNKNOWN_RETURN_CODE;
     lwmqtt_err_t e;
     {
         std::lock_guard<std::mutex> lk(impl_->lwMutex);
-        e = lwmqtt_connect(&impl_->lw, opts, nullptr, &rc, timeoutMs);
+        e = lwmqtt_connect(&impl_->lw, &opts, nullptr, timeoutMs);
     }
+    lwmqtt_return_code_t rc = opts.return_code;
     if (e != LWMQTT_SUCCESS || rc != LWMQTT_CONNECTION_ACCEPTED) {
         impl_->enqueueError("CONNECT failed err=" + std::to_string((int)e)
                             + " rc=" + std::to_string((int)rc));
@@ -429,8 +429,9 @@ bool MQTTClient::publish(const std::string& topic,
     m.retained = retain;
     m.payload  = const_cast<uint8_t*>(data);
     m.payload_len = len;
+    lwmqtt_publish_options_t pubOpts = lwmqtt_default_publish_options;
     std::lock_guard<std::mutex> lk(impl_->lwMutex);
-    return lwmqtt_publish(&impl_->lw, t, m, 2000) == LWMQTT_SUCCESS;
+    return lwmqtt_publish(&impl_->lw, &pubOpts, t, m, 2000) == LWMQTT_SUCCESS;
 }
 
 void MQTTClient::update() {

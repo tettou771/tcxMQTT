@@ -28,18 +28,18 @@ void tcApp::update() {
 }
 
 void tcApp::draw() {
-    setBackground(0.08f, 0.10f, 0.12f);
-    setColor(0.9f, 0.9f, 0.95f);
+    clear(0.08f, 0.10f, 0.12f, 1.0f);
+    setColor(Color(0.9f, 0.9f, 0.95f));
     float y = 30;
-    drawText("tcxMQTT — asyncPubSub (Event<T> listeners)", 20, y);
+    drawBitmapString("tcxMQTT — asyncPubSub (Event<T> listeners)", 20, y);
     y += 24;
-    drawText("Space = publish \"ping\" to " + topic_, 20, y);
+    drawBitmapString("Space = publish \"ping\" to " + topic_, 20, y);
     y += 18;
-    drawText("Status: " + string(mqtt_.isConnected() ? "CONNECTED" : "DISCONNECTED"),
+    drawBitmapString("Status: " + string(mqtt_.isConnected() ? "CONNECTED" : "DISCONNECTED"),
              20, y);
     y += 26;
     for (auto& line : log_) {
-        drawText(line, 20, y);
+        drawBitmapString(line, 20, y);
         y += 16;
     }
 }

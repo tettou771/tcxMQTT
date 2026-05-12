@@ -9,3 +9,4 @@ example-*/CMakePresets.json
 example-*/build/
 example-*/build-*/
 example-*/bin/
+example-*/.vscode/
