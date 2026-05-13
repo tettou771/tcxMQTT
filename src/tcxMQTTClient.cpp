@@ -350,14 +350,21 @@ bool MQTTClient::Impl::tryConnectInternal() {
         }
     }
 
-    // Last Will & Testament (optional)
+    // Last Will & Testament (optional). Build lwmqtt_string_t fields by
+    // hand instead of via lwmqtt_string(c_str()) — the latter uses strlen,
+    // which would silently truncate a binary payload at the first NUL.
+    // MQTT 3.1.1 will payloads are arbitrary bytes per spec.
     lwmqtt_will_t will = lwmqtt_default_will;
     lwmqtt_will_t* willPtr = nullptr;
-    if (willSet) {
-        will.topic    = lwmqtt_string(willTopic.c_str());
-        will.qos      = (lwmqtt_qos_t)willQos;
-        will.retained = willRetain;
-        will.payload  = lwmqtt_string(willPayload.c_str());
+    if (willSet
+        && willTopic.size()   <= UINT16_MAX
+        && willPayload.size() <= UINT16_MAX) {
+        will.topic.data    = const_cast<char*>(willTopic.data());
+        will.topic.len     = (uint16_t)willTopic.size();
+        will.qos           = (lwmqtt_qos_t)willQos;
+        will.retained      = willRetain;
+        will.payload.data  = const_cast<char*>(willPayload.data());
+        will.payload.len   = (uint16_t)willPayload.size();
         willPtr = &will;
     }
 
