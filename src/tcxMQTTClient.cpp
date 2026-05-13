@@ -88,7 +88,7 @@ struct MQTTClient::Impl {
 
     // ---- auto-reconnect ----------------------------------------------------
     std::atomic<bool> autoReconnect{false};
-    int retryIntervalMs = 5000;
+    std::atomic<int>  retryIntervalMs{5000};
     // Remembered for reconnect (last successful connect()'s args).
     std::string lastHost;
     int         lastPort = 0;
@@ -295,7 +295,7 @@ void MQTTClient::Impl::yieldLoop() {
 
         // --- reconnect loop: retry forever (or until disconnect() / autoReconnect=false) ---
         while (yieldRunning && autoReconnect && !connected) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(retryIntervalMs));
+            std::this_thread::sleep_for(std::chrono::milliseconds(retryIntervalMs.load()));
             if (!yieldRunning || !autoReconnect) break;
             if (tryConnectInternal()) break;  // success -> back to outer loop
         }
