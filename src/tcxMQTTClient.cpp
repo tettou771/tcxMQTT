@@ -133,9 +133,9 @@ lwmqtt_err_t MQTTClient::Impl::netRead(void* ref, uint8_t* buf, size_t len,
 
     std::unique_lock<std::mutex> lk(self->rxMutex);
     while (*read < len) {
-        if (self->rxClosed) return LWMQTT_NETWORK_FAILED_READ;
-
-        // Drain as much as available
+        // Drain rxBuf BEFORE checking rxClosed: a peer that sends the
+        // last bytes of a packet then immediately FINs would otherwise
+        // see those bytes dropped if the close notification beat us here.
         size_t avail = self->rxBuf.size();
         if (avail > 0) {
             size_t take = std::min(avail, len - *read);
@@ -143,6 +143,9 @@ lwmqtt_err_t MQTTClient::Impl::netRead(void* ref, uint8_t* buf, size_t len,
             self->rxBuf.erase(self->rxBuf.begin(), self->rxBuf.begin() + take);
             *read += take;
             continue;
+        }
+        if (self->rxClosed) {
+            return *read > 0 ? LWMQTT_SUCCESS : LWMQTT_NETWORK_FAILED_READ;
         }
 
         // Wait for more data
