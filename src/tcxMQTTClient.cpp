@@ -42,8 +42,11 @@ struct MQTTClient::Impl {
     int64_t keepAliveDeadline = 0;
     int64_t commandDeadline = 0;
 
-    // ---- TCP transport -----------------------------------------------------
-    TcpClient tcp;
+    // ---- transport ---------------------------------------------------------
+    // Held by unique_ptr so the user can swap in a TlsClient (or any
+    // other TcpClient subclass) via MQTTClient::setTransport(). Default
+    // is plain TcpClient, constructed in MQTTClient::MQTTClient().
+    std::unique_ptr<TcpClient> tcp;
     EventListener tcpConnect;
     EventListener tcpReceive;
     EventListener tcpDisconnect;
@@ -129,6 +132,7 @@ struct MQTTClient::Impl {
     void enqueueConnect();
     void enqueueDisconnect();
     void enqueueError(std::string s);
+    void wireTransport();        // (re)attach event listeners to tcp.
     void yieldLoop();
     bool tryConnectInternal();   // TCP + MQTT CONNECT using saved credentials
 };
@@ -181,7 +185,7 @@ lwmqtt_err_t MQTTClient::Impl::netWrite(void* ref, uint8_t* buf, size_t len,
     }
     // TrussC TcpClient::send is best-effort synchronous (writes to OS socket).
     // We treat the whole buffer as written if send returns true.
-    bool ok = self->tcp.send(reinterpret_cast<const char*>(buf), len);
+    bool ok = self->tcp->send(reinterpret_cast<const char*>(buf), len);
     *sent = ok ? len : 0;
     return ok ? LWMQTT_SUCCESS : LWMQTT_NETWORK_FAILED_WRITE;
 }
@@ -313,7 +317,7 @@ void MQTTClient::Impl::yieldLoop() {
             connected = false;
             enqueueDisconnect();
         }
-        tcp.disconnect();
+        tcp->disconnect();
         {
             std::lock_guard<std::mutex> lk(rxMutex);
             rxClosed = true;
@@ -343,20 +347,20 @@ bool MQTTClient::Impl::tryConnectInternal() {
         rxClosed = false;
     }
 
-    if (!tcp.connect(lastHost, lastPort)) {
-        enqueueError("tcp.connect failed");
+    if (!tcp->connect(lastHost, lastPort)) {
+        enqueueError("transport connect failed");
         return false;
     }
-    // Wait briefly for the TCP layer to actually come up.
+    // Wait briefly for the transport (TCP/TLS handshake) to come up.
     auto deadline = std::chrono::steady_clock::now()
                   + std::chrono::milliseconds(lastTimeoutMs);
-    while (!tcp.isConnected()
+    while (!tcp->isConnected()
            && std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
-    if (!tcp.isConnected()) {
-        enqueueError("tcp connect timeout");
-        tcp.disconnect();
+    if (!tcp->isConnected()) {
+        enqueueError("transport connect timeout");
+        tcp->disconnect();
         return false;
     }
 
@@ -407,7 +411,7 @@ bool MQTTClient::Impl::tryConnectInternal() {
     if (e != LWMQTT_SUCCESS || rc != LWMQTT_CONNECTION_ACCEPTED) {
         enqueueError("CONNECT failed err=" + std::to_string((int)e)
                      + " rc=" + std::to_string((int)rc));
-        tcp.disconnect();
+        tcp->disconnect();
         return false;
     }
 
@@ -420,8 +424,53 @@ bool MQTTClient::Impl::tryConnectInternal() {
 // MQTTClient public methods
 // =============================================================================
 
+// Subscribe Impl to the current transport's receive/disconnect/error events.
+// Called from the constructor (default TcpClient) and from setTransport()
+// (user-supplied subclass, typically TlsClient). Replaces any existing
+// subscriptions — old EventListeners RAII-detach when overwritten.
+void MQTTClient::Impl::wireTransport() {
+    tcp->setUseThread(true);
+    tcpReceive = tcp->onReceive.listen(
+        [this](TcpReceiveEventArgs& a) {
+            bool overflow = false;
+            {
+                std::lock_guard<std::mutex> lk(rxMutex);
+                if (rxBuf.size() + a.data.size() > RX_BUF_MAX) {
+                    overflow = true;
+                } else {
+                    rxBuf.insert(rxBuf.end(), a.data.begin(), a.data.end());
+                    rxCv.notify_all();
+                }
+            }
+            if (overflow) {
+                enqueueError("rx buffer overflow (>1MiB queued)");
+                std::lock_guard<std::mutex> lk(rxMutex);
+                rxClosed = true;
+                rxCv.notify_all();
+            }
+        });
+    tcpDisconnect = tcp->onDisconnect.listen(
+        [this](TcpDisconnectEventArgs& /*a*/) {
+            {
+                std::lock_guard<std::mutex> lk(rxMutex);
+                rxClosed = true;
+                rxCv.notify_all();
+            }
+            if (connected) {
+                connected = false;
+                enqueueDisconnect();
+            }
+        });
+    tcpError = tcp->onError.listen(
+        [this](TcpErrorEventArgs& a) {
+            enqueueError("transport: " + a.message);
+        });
+}
+
 MQTTClient::MQTTClient() : impl_(std::make_unique<Impl>()) {
     impl_->owner = this;
+    impl_->tcp = std::make_unique<TcpClient>();
+
     lwmqtt_init(&impl_->lw,
                 impl_->writeBuf, Impl::BUF,
                 impl_->readBuf,  Impl::BUF);
@@ -437,48 +486,9 @@ MQTTClient::MQTTClient() : impl_(std::make_unique<Impl>()) {
     // client and, with auto-reconnect on, loop forever.
     lwmqtt_drop_overflow(&impl_->lw, true, nullptr);
 
-    // Wire TcpClient events. We use the synchronous send() path for outgoing,
-    // and accumulate incoming bytes into rxBuf where netRead can pull them.
-    impl_->tcp.setUseThread(true);
-    impl_->tcpReceive = impl_->tcp.onReceive.listen(
-        [this](TcpReceiveEventArgs& a) {
-            bool overflow = false;
-            {
-                std::lock_guard<std::mutex> lk(impl_->rxMutex);
-                if (impl_->rxBuf.size() + a.data.size() > Impl::RX_BUF_MAX) {
-                    overflow = true;
-                } else {
-                    impl_->rxBuf.insert(impl_->rxBuf.end(),
-                                        a.data.begin(), a.data.end());
-                    impl_->rxCv.notify_all();
-                }
-            }
-            if (overflow) {
-                // Broker is sending faster than we can drain, or sending a
-                // packet larger than the cap. Tear down to fail fast rather
-                // than OOM. The yield thread will see rxClosed and exit.
-                impl_->enqueueError("rx buffer overflow (>1MiB queued)");
-                std::lock_guard<std::mutex> lk(impl_->rxMutex);
-                impl_->rxClosed = true;
-                impl_->rxCv.notify_all();
-            }
-        });
-    impl_->tcpDisconnect = impl_->tcp.onDisconnect.listen(
-        [this](TcpDisconnectEventArgs& /*a*/) {
-            {
-                std::lock_guard<std::mutex> lk(impl_->rxMutex);
-                impl_->rxClosed = true;
-                impl_->rxCv.notify_all();
-            }
-            if (impl_->connected) {
-                impl_->connected = false;
-                impl_->enqueueDisconnect();
-            }
-        });
-    impl_->tcpError = impl_->tcp.onError.listen(
-        [this](TcpErrorEventArgs& a) {
-            impl_->enqueueError("tcp: " + a.message);
-        });
+    // Wire transport events: bytes in -> rxBuf, disconnect -> rxClosed,
+    // errors -> onError. Sends are pushed synchronously by netWrite.
+    impl_->wireTransport();
 }
 
 MQTTClient::~MQTTClient() {
@@ -521,7 +531,7 @@ void MQTTClient::disconnect() {
         lwmqtt_disconnect(&impl_->lw, 200);
         impl_->connected = false;
     }
-    impl_->tcp.disconnect();
+    impl_->tcp->disconnect();
     {
         std::lock_guard<std::mutex> lk(impl_->rxMutex);
         impl_->rxClosed = true;
@@ -530,7 +540,7 @@ void MQTTClient::disconnect() {
 }
 
 bool MQTTClient::isConnected() const {
-    return impl_->connected && impl_->tcp.isConnected();
+    return impl_->connected && impl_->tcp->isConnected();
 }
 
 bool MQTTClient::subscribe(const std::string& topic, int qos) {
@@ -658,6 +668,16 @@ void MQTTClient::clearWill() {
 void MQTTClient::setAutoReconnect(bool enable, int retryIntervalMs) {
     impl_->autoReconnect    = enable;
     impl_->retryIntervalMs  = retryIntervalMs > 0 ? retryIntervalMs : 5000;
+}
+
+bool MQTTClient::setTransport(std::unique_ptr<TcpClient> transport) {
+    // Reject while connected — swapping a live transport out from under
+    // the yield thread would race with netRead/netWrite.
+    if (isConnected() || impl_->yieldRunning) return false;
+    impl_->tcp = transport ? std::move(transport)
+                            : std::make_unique<TcpClient>();
+    impl_->wireTransport();  // re-attach listeners; old ones detach via RAII.
+    return true;
 }
 
 } // namespace tcx

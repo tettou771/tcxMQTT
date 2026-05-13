@@ -18,6 +18,8 @@
 #include <memory>
 #include <string>
 
+namespace trussc { class TcpClient; }
+
 namespace tcx {
 
 class MQTTClient {
@@ -105,6 +107,25 @@ public:
     // should re-subscribe there if they care (subscriptions are not
     // remembered by this client).
     void setAutoReconnect(bool enable, int retryIntervalMs = 5000);
+
+    // -------------------------------------------------------------------------
+    // Transport (advanced — for TLS / MQTTS)
+    // -------------------------------------------------------------------------
+    // Replace the default plain-TCP transport with a custom one.
+    //
+    // Typical use is MQTTS via the tcxTls addon:
+    //
+    //   #include "tcTlsClient.h"
+    //   auto tls = std::make_unique<tc::TlsClient>();
+    //   tls->setHostname("broker.example.com");        // SNI / cert verify
+    //   // tls->setVerifyNone();                        // testing only
+    //   mqtt.setTransport(std::move(tls));
+    //   mqtt.connect("broker.example.com", 8883, ...);
+    //
+    // Must be called BEFORE connect() (or after disconnect()). Returns
+    // false and ignores the transport if currently connected. Passing
+    // nullptr resets to the default plain TcpClient.
+    bool setTransport(std::unique_ptr<::trussc::TcpClient> transport);
 
 private:
     struct Impl;
