@@ -24,8 +24,8 @@ TrussC's network layer works).
     `update()` loop; the internal queue is allocated lazily on first
     poll, so async-only users pay no queue cost
 - Username / password auth (anonymous if both empty)
-- Plain TCP today; TLS is on the roadmap (would route through
-  TrussC's `TlsClient` instead of `TcpClient`)
+- **TLS / MQTTS** via the `tcxTls` addon — see `example-tlsPubSub/`
+  and the *Transport (TLS)* section below.
 
 ## Install
 
@@ -40,8 +40,9 @@ then `trusscli update` and `trusscli build`.
 
 ## Examples
 
-See `example-basicPubSub/` (sync polling style) and `example-asyncPubSub/`
-(event listener style) in this addon directory.
+- `example-basicPubSub/` — sync polling style, plain TCP
+- `example-asyncPubSub/` — event listener style, plain TCP
+- `example-tlsPubSub/` — async + MQTTS over `tcxTls`
 
 Both examples read broker connection details from environment variables so
 passwords don't end up in the repo:
@@ -89,6 +90,34 @@ class tcApp : public App {
     }
 };
 ```
+
+## Transport (TLS)
+
+The default transport is plain TCP. To speak **MQTTS**, install the
+[`tcxTls`](../tcxTls) addon (mbedTLS-based), build a `TlsClient`,
+configure it, and hand it to `MQTTClient::setTransport()` BEFORE
+`connect()`:
+
+```cpp
+#include "tcxMQTT.h"
+#include "tcTlsClient.h"
+using namespace tc;
+using namespace tcx;
+
+MQTTClient mqtt;
+
+auto tls = std::make_unique<TlsClient>();
+tls->setHostname("broker.example.com");        // SNI + cert verify
+// tls->setCACertificateFile("/path/to/ca.pem"); // optional private CA
+// tls->setVerifyNone();                          // testing only
+
+mqtt.setTransport(std::move(tls));
+mqtt.connect("broker.example.com", 8883, /*clientId*/ "", "alice", "s3cret");
+```
+
+`setTransport(nullptr)` resets back to plain TCP. The call is rejected
+while connected — call `disconnect()` first if you want to switch
+transports at runtime.
 
 ## License
 
