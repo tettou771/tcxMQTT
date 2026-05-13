@@ -79,6 +79,24 @@ struct MQTTClient::Impl {
     int keepAliveSec = 60;
     bool cleanSession = true;
 
+    // ---- Last Will & Testament --------------------------------------------
+    bool        willSet = false;
+    std::string willTopic;
+    std::string willPayload;
+    int         willQos = 0;
+    bool        willRetain = false;
+
+    // ---- auto-reconnect ----------------------------------------------------
+    std::atomic<bool> autoReconnect{false};
+    int retryIntervalMs = 5000;
+    // Remembered for reconnect (last successful connect()'s args).
+    std::string lastHost;
+    int         lastPort = 0;
+    std::string lastClientId;
+    std::string lastUser;
+    std::string lastPass;
+    int         lastTimeoutMs = 5000;
+
     // ---- state -------------------------------------------------------------
     std::atomic<bool> connected{false};
     std::mutex lwMutex;  // serialize lwmqtt_* calls
@@ -98,6 +116,7 @@ struct MQTTClient::Impl {
     void enqueueDisconnect();
     void enqueueError(std::string s);
     void yieldLoop();
+    bool tryConnectInternal();   // TCP + MQTT CONNECT using saved credentials
 };
 
 // =============================================================================
@@ -228,32 +247,133 @@ void MQTTClient::Impl::resetState() {
 // =============================================================================
 
 void MQTTClient::Impl::yieldLoop() {
+    // Outer loop alternates between "session live (yield + keep_alive)" and
+    // "session lost (optional auto-reconnect)". On graceful disconnect()
+    // yieldRunning flips to false and we exit cleanly.
     while (yieldRunning) {
-        {
-            std::lock_guard<std::mutex> lk(lwMutex);
-            // 200ms slice — lwmqtt_yield blocks up to this long inside netRead.
-            lwmqtt_err_t e = lwmqtt_yield(&lw, BUF, 200);
-            if (e != LWMQTT_SUCCESS && e != LWMQTT_NETWORK_TIMEOUT) {
-                enqueueError("lwmqtt_yield: " + std::to_string((int)e));
-                if (connected) {
-                    connected = false;
-                    enqueueDisconnect();
+        // --- session live: drive lwmqtt until something breaks ---
+        bool sessionLive = true;
+        while (yieldRunning && sessionLive) {
+            {
+                std::lock_guard<std::mutex> lk(lwMutex);
+                // 200ms slice — lwmqtt_yield blocks up to this long inside netRead.
+                lwmqtt_err_t e = lwmqtt_yield(&lw, BUF, 200);
+                if (e != LWMQTT_SUCCESS && e != LWMQTT_NETWORK_TIMEOUT) {
+                    enqueueError("lwmqtt_yield: " + std::to_string((int)e));
+                    sessionLive = false;
+                } else {
+                    e = lwmqtt_keep_alive(&lw, 1000);
+                    if (e != LWMQTT_SUCCESS) {
+                        enqueueError("lwmqtt_keep_alive: " + std::to_string((int)e));
+                        sessionLive = false;
+                    }
                 }
-                break;
             }
-            e = lwmqtt_keep_alive(&lw, 1000);
-            if (e != LWMQTT_SUCCESS) {
-                enqueueError("lwmqtt_keep_alive: " + std::to_string((int)e));
-                if (connected) {
-                    connected = false;
-                    enqueueDisconnect();
-                }
-                break;
+            if (sessionLive) {
+                // tiny sleep so we don't pin a core when there's no traffic
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
             }
         }
-        // tiny sleep so we don't pin a core when there's no traffic
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+        // --- session dropped ---
+        if (connected) {
+            connected = false;
+            enqueueDisconnect();
+        }
+        tcp.disconnect();
+        {
+            std::lock_guard<std::mutex> lk(rxMutex);
+            rxClosed = true;
+            rxCv.notify_all();
+            rxBuf.clear();
+        }
+
+        if (!autoReconnect) break;  // exit thread, stay disconnected
+
+        // --- reconnect loop: retry forever (or until disconnect() / autoReconnect=false) ---
+        while (yieldRunning && autoReconnect && !connected) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(retryIntervalMs));
+            if (!yieldRunning || !autoReconnect) break;
+            if (tryConnectInternal()) break;  // success -> back to outer loop
+        }
     }
+}
+
+// Used both by MQTTClient::connect() (initial connect) and by yieldLoop()
+// (reconnect path). All connection parameters come from the saved last*
+// fields; the caller is responsible for setting them before invoking us.
+bool MQTTClient::Impl::tryConnectInternal() {
+    if (connected) return true;
+    {
+        std::lock_guard<std::mutex> lk(rxMutex);
+        rxBuf.clear();
+        rxClosed = false;
+    }
+
+    if (!tcp.connect(lastHost, lastPort)) {
+        enqueueError("tcp.connect failed");
+        return false;
+    }
+    // Wait briefly for the TCP layer to actually come up.
+    auto deadline = std::chrono::steady_clock::now()
+                  + std::chrono::milliseconds(lastTimeoutMs);
+    while (!tcp.isConnected()
+           && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    if (!tcp.isConnected()) {
+        enqueueError("tcp connect timeout");
+        tcp.disconnect();
+        return false;
+    }
+
+    // Build CONNECT options
+    lwmqtt_connect_options_t opts = lwmqtt_default_connect_options;
+    std::string cid = lastClientId;
+    if (cid.empty()) {
+        std::random_device rd;
+        char tmp[24];
+        std::snprintf(tmp, sizeof(tmp), "tcxmqtt-%08x", (unsigned)rd());
+        cid = tmp;
+    }
+    opts.client_id     = lwmqtt_string(cid.c_str());
+    opts.keep_alive    = (uint16_t)keepAliveSec;
+    opts.clean_session = cleanSession;
+
+    if (!lastUser.empty()) {
+        opts.username = lwmqtt_string(lastUser.c_str());
+        if (!lastPass.empty()) {
+            opts.password = lwmqtt_string(lastPass.c_str());
+        }
+    }
+
+    // Last Will & Testament (optional)
+    lwmqtt_will_t will = lwmqtt_default_will;
+    lwmqtt_will_t* willPtr = nullptr;
+    if (willSet) {
+        will.topic    = lwmqtt_string(willTopic.c_str());
+        will.qos      = (lwmqtt_qos_t)willQos;
+        will.retained = willRetain;
+        will.payload  = lwmqtt_string(willPayload.c_str());
+        willPtr = &will;
+    }
+
+    lwmqtt_err_t e;
+    {
+        std::lock_guard<std::mutex> lk(lwMutex);
+        e = lwmqtt_connect(&lw, &opts, willPtr, lastTimeoutMs);
+    }
+    lwmqtt_return_code_t rc = opts.return_code;
+    if (e != LWMQTT_SUCCESS || rc != LWMQTT_CONNECTION_ACCEPTED) {
+        enqueueError("CONNECT failed err=" + std::to_string((int)e)
+                     + " rc=" + std::to_string((int)rc));
+        tcp.disconnect();
+        return false;
+    }
+
+    connected = true;
+    enqueueConnect();
+    return true;
 }
 
 // =============================================================================
@@ -309,69 +429,23 @@ bool MQTTClient::connect(const std::string& host, int port,
                           const std::string& password,
                           int timeoutMs) {
     if (impl_->connected) return true;
-    impl_->resetState();
 
-    if (!impl_->tcp.connect(host, port)) {
-        impl_->enqueueError("tcp.connect failed");
-        return false;
-    }
-    // Wait for TCP to actually be up. TcpClient's connect is typically
-    // synchronous from the caller's perspective if useThread=false; with
-    // useThread=true we briefly wait for the onConnect notify or a timeout.
-    auto deadline = std::chrono::steady_clock::now()
-                  + std::chrono::milliseconds(timeoutMs);
-    while (!impl_->tcp.isConnected()
-           && std::chrono::steady_clock::now() < deadline) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-    if (!impl_->tcp.isConnected()) {
-        impl_->enqueueError("tcp connect timeout");
-        impl_->tcp.disconnect();
-        return false;
-    }
+    // Remember the credentials so the auto-reconnect path in yieldLoop()
+    // can rebuild the same session without the caller having to redrive it.
+    impl_->lastHost      = host;
+    impl_->lastPort      = port;
+    impl_->lastClientId  = clientId;
+    impl_->lastUser      = username;
+    impl_->lastPass      = password;
+    impl_->lastTimeoutMs = timeoutMs;
 
-    // Build CONNECT options
-    lwmqtt_connect_options_t opts = lwmqtt_default_connect_options;
-    std::string cid = clientId;
-    if (cid.empty()) {
-        // Generate a small random suffix
-        std::random_device rd;
-        char tmp[24];
-        std::snprintf(tmp, sizeof(tmp), "tcxmqtt-%08x", (unsigned)rd());
-        cid = tmp;
-    }
-    opts.client_id   = lwmqtt_string(cid.c_str());
-    opts.keep_alive  = (uint16_t)impl_->keepAliveSec;
-    opts.clean_session = impl_->cleanSession;
+    if (!impl_->tryConnectInternal()) return false;
 
-    lwmqtt_string_t userStr = lwmqtt_default_string;
-    lwmqtt_string_t passStr = lwmqtt_default_string;
-    if (!username.empty()) {
-        userStr = lwmqtt_string(username.c_str());
-        opts.username = userStr;
-        if (!password.empty()) {
-            passStr = lwmqtt_string(password.c_str());
-            opts.password = passStr;
-        }
+    // Spawn the yield/reconnect worker exactly once.
+    if (!impl_->yieldRunning) {
+        impl_->yieldRunning = true;
+        impl_->yieldThread = std::thread([this]() { impl_->yieldLoop(); });
     }
-
-    lwmqtt_err_t e;
-    {
-        std::lock_guard<std::mutex> lk(impl_->lwMutex);
-        e = lwmqtt_connect(&impl_->lw, &opts, nullptr, timeoutMs);
-    }
-    lwmqtt_return_code_t rc = opts.return_code;
-    if (e != LWMQTT_SUCCESS || rc != LWMQTT_CONNECTION_ACCEPTED) {
-        impl_->enqueueError("CONNECT failed err=" + std::to_string((int)e)
-                            + " rc=" + std::to_string((int)rc));
-        impl_->tcp.disconnect();
-        return false;
-    }
-
-    impl_->connected = true;
-    impl_->yieldRunning = true;
-    impl_->yieldThread = std::thread([this]() { impl_->yieldLoop(); });
-    impl_->enqueueConnect();
     return true;
 }
 
@@ -493,5 +567,25 @@ size_t MQTTClient::getBufferSize() const { return impl_->bufferMax; }
 
 void MQTTClient::setKeepAlive(int seconds) { impl_->keepAliveSec = seconds; }
 void MQTTClient::setCleanSession(bool clean) { impl_->cleanSession = clean; }
+
+void MQTTClient::setWill(const std::string& topic, const std::string& payload,
+                         int qos, bool retain) {
+    impl_->willSet     = true;
+    impl_->willTopic   = topic;
+    impl_->willPayload = payload;
+    impl_->willQos     = qos;
+    impl_->willRetain  = retain;
+}
+
+void MQTTClient::clearWill() {
+    impl_->willSet = false;
+    impl_->willTopic.clear();
+    impl_->willPayload.clear();
+}
+
+void MQTTClient::setAutoReconnect(bool enable, int retryIntervalMs) {
+    impl_->autoReconnect    = enable;
+    impl_->retryIntervalMs  = retryIntervalMs > 0 ? retryIntervalMs : 5000;
+}
 
 } // namespace tcx

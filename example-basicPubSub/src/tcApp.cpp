@@ -1,3 +1,23 @@
+/*
+ * basicPubSub — sync polling demo for tcxMQTT.
+ *
+ * Connects to a broker on setup(), subscribes to one topic, then in every
+ * update() drains whatever has arrived with `MQTTClient::getNextMessage()`.
+ * No listeners, no RAII gotchas — just `hasNewMessage()` / `getNextMessage()`
+ * mirroring tcxOscReceiver's polling API. Use this style when you'd rather
+ * keep message handling inline in your update loop than reason about
+ * listener lifetimes.
+ *
+ * Press Space to publish a "ping@<seconds>" payload back to the same
+ * topic. Because we're also subscribed, the broker echoes it to us and
+ * the round-trip is visible in the on-screen log.
+ *
+ * Broker connection details are read from env vars
+ * (TCXMQTT_HOST / TCXMQTT_PORT / TCXMQTT_USER / TCXMQTT_PASS / TCXMQTT_TOPIC)
+ * if set, otherwise the defaults in tcApp.h target a local mosquitto at
+ * localhost:1883.
+ */
+
 #include "tcApp.h"
 #include <cstdlib>
 

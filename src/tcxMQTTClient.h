@@ -87,6 +87,20 @@ public:
     void setKeepAlive(int seconds);     // default 60
     void setCleanSession(bool clean);   // default true
 
+    // Last Will & Testament — broker publishes `payload` to `topic` if
+    // this client disconnects ungracefully. Standard MQTT presence
+    // pattern. Pass before connect(); takes effect on next connect.
+    void setWill(const std::string& topic, const std::string& payload,
+                 int qos = 0, bool retain = false);
+    void clearWill();
+
+    // Auto-reconnect — when the link drops, retry connect() on a
+    // background thread with the same credentials. Disabled by default.
+    // On each successful reconnect, onConnect fires again; listeners
+    // should re-subscribe there if they care (subscriptions are not
+    // remembered by this client).
+    void setAutoReconnect(bool enable, int retryIntervalMs = 5000);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

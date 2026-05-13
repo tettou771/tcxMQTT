@@ -1,3 +1,27 @@
+/*
+ * asyncPubSub — Event<T> + EventListener demo for tcxMQTT.
+ *
+ * Demonstrates the listener-based API: each `Event<T>` exposed by
+ * `MQTTClient` (`onConnect`, `onDisconnect`, `onMessage`, `onError`) is
+ * bound via `.listen([](...) { ... })`. The returned EventListener is
+ * stored as a member so it stays alive — TrussC's listener pattern is
+ * RAII; when the EventListener is destroyed the lambda unsubscribes
+ * automatically. Reach for this style when you want event-driven
+ * dispatch instead of polling, or when you need to react to connect /
+ * disconnect / error edges as well as plain messages.
+ *
+ * onConnect (re-)subscribes after every successful CONNACK, so a future
+ * tcxMQTT auto-reconnect path will resubscribe seamlessly without app
+ * changes. onMessage logs payloads. Press Space to publish back to the
+ * same topic; the broker echoes it and the round-trip lights up in the
+ * on-screen log.
+ *
+ * Broker connection details are read from env vars
+ * (TCXMQTT_HOST / TCXMQTT_PORT / TCXMQTT_USER / TCXMQTT_PASS / TCXMQTT_TOPIC)
+ * if set, otherwise the defaults in tcApp.h target a local mosquitto at
+ * localhost:1883.
+ */
+
 #include "tcApp.h"
 #include <cstdlib>
 

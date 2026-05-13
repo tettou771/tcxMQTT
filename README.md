@@ -9,6 +9,13 @@ TrussC's network layer works).
 ## Features
 
 - MQTT 3.1.1 (QoS 0/1/2, retained, will, clean session)
+- **Last Will & Testament** — `client.setWill(topic, payload, qos, retain)`
+  for the standard online/offline presence pattern
+- **Auto-reconnect** — `client.setAutoReconnect(true, retryIntervalMs)`;
+  on link loss the worker thread retries `connect()` forever (or until
+  `disconnect()`) and re-fires `onConnect` for each successful reattach.
+  Subscriptions are not remembered — re-subscribe in your `onConnect`
+  listener (see `example-asyncPubSub`).
 - **Two usage patterns**, mix freely:
   - **Async**: register listeners on `Event<T>` members (`onMessage`,
     `onConnect`, `onDisconnect`, `onError`) — `EventListener` RAII
