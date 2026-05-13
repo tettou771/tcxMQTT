@@ -36,6 +36,22 @@ then `trusscli update` and `trusscli build`.
 See `example-basicPubSub/` (sync polling style) and `example-asyncPubSub/`
 (event listener style) in this addon directory.
 
+Both examples read broker connection details from environment variables so
+passwords don't end up in the repo:
+
+```bash
+cd example-asyncPubSub
+TCXMQTT_HOST=broker.example.com \
+TCXMQTT_PORT=1883 \
+TCXMQTT_USER=alice \
+TCXMQTT_PASS=s3cret \
+TCXMQTT_TOPIC=tcxMQTT/test \
+  trusscli run
+```
+
+Without env vars they default to `localhost:1883` — handy for running a
+throwaway `mosquitto -p 1883` locally.
+
 ## API sketch
 
 ```cpp

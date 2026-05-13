@@ -1,7 +1,16 @@
 #include "tcApp.h"
+#include <cstdlib>
 
 void tcApp::setup() {
     setIndependentFps(VSYNC, 0);
+
+    // Env-var overrides so a real broker (with auth) can be exercised without
+    // committing the password. Defaults in tcApp.h target a local mosquitto.
+    if (const char* v = std::getenv("TCXMQTT_HOST"))  host_  = v;
+    if (const char* v = std::getenv("TCXMQTT_PORT"))  port_  = std::atoi(v);
+    if (const char* v = std::getenv("TCXMQTT_USER"))  user_  = v;
+    if (const char* v = std::getenv("TCXMQTT_PASS"))  pass_  = v;
+    if (const char* v = std::getenv("TCXMQTT_TOPIC")) topic_ = v;
 
     // Hook up listeners BEFORE connect, so the onConnect notify isn't missed.
     msgListener_ = mqtt_.onMessage.listen([this](MQTTMessage& m) {
