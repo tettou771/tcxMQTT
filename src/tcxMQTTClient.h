@@ -78,6 +78,11 @@ public:
     bool   hasNewMessage();
     bool   getNextMessage(MQTTMessage& out);
     size_t numNewMessages() const;
+    // Caps BOTH the sync polling queue and the async dispatch queue at
+    // `size` entries each. On overflow the oldest entry is dropped.
+    // Default 1024. Set higher if your app legitimately bursts more
+    // events than that between update() calls; set lower for memory-
+    // constrained devices.
     void   setBufferSize(size_t size);
     size_t getBufferSize() const;
 

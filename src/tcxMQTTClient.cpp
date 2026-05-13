@@ -75,17 +75,18 @@ struct MQTTClient::Impl {
     // Bounded pending queue. Without a cap a flood of broker PUBLISHes
     // delivered while the app's update() is slow would grow this queue
     // unboundedly. When full we drop the oldest message and emit at most
-    // one error notification so the user can react.
+    // one error notification so the user can react. The cap is shared
+    // with syncQueue via bufferMax (see setBufferSize()).
     std::queue<Pending> pending;
     std::mutex pendingMutex;
-    static constexpr size_t PENDING_MAX = 1024;
     bool pendingOverflowReported = false;
 
     // ---- sync polling queue ------------------------------------------------
     std::queue<MQTTMessage> syncQueue;
     std::mutex syncMutex;
     std::atomic<bool> bufferEnabled{false};
-    size_t bufferMax = 100;
+    // Cap shared by syncQueue and pending — see setBufferSize().
+    std::atomic<size_t> bufferMax{1024};
 
     // ---- options -----------------------------------------------------------
     int keepAliveSec = 60;
@@ -230,8 +231,9 @@ void MQTTClient::Impl::msgCb(lwmqtt_client_t* /*client*/, void* ref,
 // recent state) and a single overflow-error notice is queued once until
 // drained. Must be called with pendingMutex NOT held.
 void MQTTClient::Impl::pushPending(Pending&& p) {
+    const size_t cap = bufferMax.load();
     std::lock_guard<std::mutex> lk(pendingMutex);
-    if (pending.size() >= PENDING_MAX) {
+    if (pending.size() >= cap) {
         pending.pop();
         if (!pendingOverflowReported) {
             pendingOverflowReported = true;
@@ -240,18 +242,19 @@ void MQTTClient::Impl::pushPending(Pending&& p) {
         }
     } else {
         // Reset the one-shot overflow flag once we have headroom again.
-        if (pending.size() < PENDING_MAX / 2) pendingOverflowReported = false;
+        if (pending.size() < cap / 2) pendingOverflowReported = false;
     }
     pending.push(std::move(p));
 }
 
 void MQTTClient::Impl::enqueueMessage(MQTTMessage&& m) {
-    // Sync queue (only if user has consulted it at least once). This one
-    // is already bounded by bufferMax (default 100).
+    // Sync queue (only if user has consulted it at least once). Bounded
+    // by the same cap as pending, see bufferMax / setBufferSize().
     if (bufferEnabled) {
+        const size_t cap = bufferMax.load();
         std::lock_guard<std::mutex> lk(syncMutex);
         syncQueue.push(m);
-        while (syncQueue.size() > bufferMax) syncQueue.pop();
+        while (syncQueue.size() > cap) syncQueue.pop();
     }
     pushPending({PendingKind::Message, std::move(m), {}});
 }
@@ -619,12 +622,19 @@ size_t MQTTClient::numNewMessages() const {
 }
 
 void MQTTClient::setBufferSize(size_t size) {
-    std::lock_guard<std::mutex> lk(impl_->syncMutex);
+    if (size == 0) size = 1;  // 0 would silently drop everything; not useful.
     impl_->bufferMax = size;
-    while (impl_->syncQueue.size() > impl_->bufferMax) impl_->syncQueue.pop();
+    {
+        std::lock_guard<std::mutex> lk(impl_->syncMutex);
+        while (impl_->syncQueue.size() > size) impl_->syncQueue.pop();
+    }
+    {
+        std::lock_guard<std::mutex> lk(impl_->pendingMutex);
+        while (impl_->pending.size() > size) impl_->pending.pop();
+    }
 }
 
-size_t MQTTClient::getBufferSize() const { return impl_->bufferMax; }
+size_t MQTTClient::getBufferSize() const { return impl_->bufferMax.load(); }
 
 void MQTTClient::setKeepAlive(int seconds) { impl_->keepAliveSec = seconds; }
 void MQTTClient::setCleanSession(bool clean) { impl_->cleanSession = clean; }
