@@ -476,6 +476,7 @@ bool MQTTClient::isConnected() const {
 
 bool MQTTClient::subscribe(const std::string& topic, int qos) {
     if (!impl_->connected) return false;
+    if (qos < 0 || qos > 2) return false;
     lwmqtt_string_t t = lwmqtt_string(topic.c_str());
     lwmqtt_qos_t q = (lwmqtt_qos_t)qos;
     std::lock_guard<std::mutex> lk(impl_->lwMutex);
@@ -500,6 +501,7 @@ bool MQTTClient::publish(const std::string& topic,
                          const uint8_t* data, size_t len,
                          int qos, bool retain) {
     if (!impl_->connected) return false;
+    if (qos < 0 || qos > 2) return false;
     lwmqtt_string_t t = lwmqtt_string(topic.c_str());
     lwmqtt_message_t m = lwmqtt_default_message;
     m.qos      = (lwmqtt_qos_t)qos;
@@ -573,6 +575,7 @@ void MQTTClient::setCleanSession(bool clean) { impl_->cleanSession = clean; }
 
 void MQTTClient::setWill(const std::string& topic, const std::string& payload,
                          int qos, bool retain) {
+    if (qos < 0 || qos > 2) qos = 0;
     impl_->willSet     = true;
     impl_->willTopic   = topic;
     impl_->willPayload = payload;
