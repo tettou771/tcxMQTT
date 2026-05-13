@@ -394,6 +394,12 @@ MQTTClient::MQTTClient() : impl_(std::make_unique<Impl>()) {
                       &Impl::timerSet, &Impl::timerGet);
     lwmqtt_set_callback(&impl_->lw, impl_.get(), &Impl::msgCb);
 
+    // Drop incoming packets larger than the read buffer instead of tearing
+    // down the session. Without this, a single >2KB PUBLISH (e.g. a
+    // retained large message on a subscribed topic) would disconnect the
+    // client and, with auto-reconnect on, loop forever.
+    lwmqtt_drop_overflow(&impl_->lw, true, nullptr);
+
     // Wire TcpClient events. We use the synchronous send() path for outgoing,
     // and accumulate incoming bytes into rxBuf where netRead can pull them.
     impl_->tcp.setUseThread(true);
