@@ -1,0 +1,13 @@
+Vendored from: https://github.com/256dpi/lwmqtt
+Commit:        1be1acd2c937d5418a2d0c15590c0d6e8a36c7e3 (2026-04-10, "bumped version")
+License:       MIT (see LICENSE in this directory)
+
+Files vendored:
+  client.c, packet.c, helpers.c, string.c
+  lwmqtt.h, packet.h, helpers.h
+
+Intentionally NOT vendored:
+  src/posix.c   — replaced by TrussC TcpClient bridge in ../tcxMQTTClient.cpp
+
+To update: replace the files above with the matching paths from a newer
+upstream commit, run the addon's tests, and update the commit hash here.
