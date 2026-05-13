@@ -14,6 +14,7 @@ extern "C" {
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <queue>
 #include <random>
@@ -50,7 +51,12 @@ struct MQTTClient::Impl {
 
     std::mutex rxMutex;
     std::condition_variable rxCv;
-    std::vector<uint8_t> rxBuf;
+    // Bounded inbound buffer. A misbehaving broker that flooded data faster
+    // than the yield thread could consume would otherwise grow rxBuf without
+    // limit and OOM the process. deque is used (not vector) so the front-
+    // erase in netRead is O(1) per chunk, not O(n^2) over the buffer.
+    std::deque<uint8_t> rxBuf;
+    static constexpr size_t RX_BUF_MAX = 1024 * 1024;  // 1 MiB
     std::atomic<bool> rxClosed{false};
 
     // ---- yield worker ------------------------------------------------------
@@ -66,8 +72,14 @@ struct MQTTClient::Impl {
         MQTTMessage msg;
         std::string err;
     };
+    // Bounded pending queue. Without a cap a flood of broker PUBLISHes
+    // delivered while the app's update() is slow would grow this queue
+    // unboundedly. When full we drop the oldest message and emit at most
+    // one error notification so the user can react.
     std::queue<Pending> pending;
     std::mutex pendingMutex;
+    static constexpr size_t PENDING_MAX = 1024;
+    bool pendingOverflowReported = false;
 
     // ---- sync polling queue ------------------------------------------------
     std::queue<MQTTMessage> syncQueue;
@@ -111,6 +123,7 @@ struct MQTTClient::Impl {
 
     // ---- helpers -----------------------------------------------------------
     void resetState();
+    void pushPending(Pending&& p);
     void enqueueMessage(MQTTMessage&& m);
     void enqueueConnect();
     void enqueueDisconnect();
@@ -139,8 +152,10 @@ lwmqtt_err_t MQTTClient::Impl::netRead(void* ref, uint8_t* buf, size_t len,
         size_t avail = self->rxBuf.size();
         if (avail > 0) {
             size_t take = std::min(avail, len - *read);
-            std::memcpy(buf + *read, self->rxBuf.data(), take);
-            self->rxBuf.erase(self->rxBuf.begin(), self->rxBuf.begin() + take);
+            for (size_t i = 0; i < take; i++) {
+                buf[*read + i] = self->rxBuf.front();
+                self->rxBuf.pop_front();
+            }
             *read += take;
             continue;
         }
@@ -210,29 +225,41 @@ void MQTTClient::Impl::msgCb(lwmqtt_client_t* /*client*/, void* ref,
 // helpers
 // =============================================================================
 
+// Push a Pending onto the dispatch queue, bounded by PENDING_MAX. On
+// overflow the OLDEST entry is dropped (so a slow app sees the most
+// recent state) and a single overflow-error notice is queued once until
+// drained. Must be called with pendingMutex NOT held.
+void MQTTClient::Impl::pushPending(Pending&& p) {
+    std::lock_guard<std::mutex> lk(pendingMutex);
+    if (pending.size() >= PENDING_MAX) {
+        pending.pop();
+        if (!pendingOverflowReported) {
+            pendingOverflowReported = true;
+            pending.push({PendingKind::Error, {},
+                          "pending queue overflow — events dropped"});
+        }
+    } else {
+        // Reset the one-shot overflow flag once we have headroom again.
+        if (pending.size() < PENDING_MAX / 2) pendingOverflowReported = false;
+    }
+    pending.push(std::move(p));
+}
+
 void MQTTClient::Impl::enqueueMessage(MQTTMessage&& m) {
-    // Sync queue (only if user has consulted it at least once)
+    // Sync queue (only if user has consulted it at least once). This one
+    // is already bounded by bufferMax (default 100).
     if (bufferEnabled) {
         std::lock_guard<std::mutex> lk(syncMutex);
         syncQueue.push(m);
         while (syncQueue.size() > bufferMax) syncQueue.pop();
     }
-    // Dispatch via pending; update() drains it on the main thread.
-    std::lock_guard<std::mutex> lk(pendingMutex);
-    pending.push({PendingKind::Message, std::move(m), {}});
+    pushPending({PendingKind::Message, std::move(m), {}});
 }
 
-void MQTTClient::Impl::enqueueConnect() {
-    std::lock_guard<std::mutex> lk(pendingMutex);
-    pending.push({PendingKind::Connect, {}, {}});
-}
-void MQTTClient::Impl::enqueueDisconnect() {
-    std::lock_guard<std::mutex> lk(pendingMutex);
-    pending.push({PendingKind::Disconnect, {}, {}});
-}
+void MQTTClient::Impl::enqueueConnect()    { pushPending({PendingKind::Connect,    {}, {}}); }
+void MQTTClient::Impl::enqueueDisconnect() { pushPending({PendingKind::Disconnect, {}, {}}); }
 void MQTTClient::Impl::enqueueError(std::string s) {
-    std::lock_guard<std::mutex> lk(pendingMutex);
-    pending.push({PendingKind::Error, {}, std::move(s)});
+    pushPending({PendingKind::Error, {}, std::move(s)});
 }
 
 void MQTTClient::Impl::resetState() {
@@ -412,10 +439,26 @@ MQTTClient::MQTTClient() : impl_(std::make_unique<Impl>()) {
     impl_->tcp.setUseThread(true);
     impl_->tcpReceive = impl_->tcp.onReceive.listen(
         [this](TcpReceiveEventArgs& a) {
-            std::lock_guard<std::mutex> lk(impl_->rxMutex);
-            impl_->rxBuf.insert(impl_->rxBuf.end(),
-                                a.data.begin(), a.data.end());
-            impl_->rxCv.notify_all();
+            bool overflow = false;
+            {
+                std::lock_guard<std::mutex> lk(impl_->rxMutex);
+                if (impl_->rxBuf.size() + a.data.size() > Impl::RX_BUF_MAX) {
+                    overflow = true;
+                } else {
+                    impl_->rxBuf.insert(impl_->rxBuf.end(),
+                                        a.data.begin(), a.data.end());
+                    impl_->rxCv.notify_all();
+                }
+            }
+            if (overflow) {
+                // Broker is sending faster than we can drain, or sending a
+                // packet larger than the cap. Tear down to fail fast rather
+                // than OOM. The yield thread will see rxClosed and exit.
+                impl_->enqueueError("rx buffer overflow (>1MiB queued)");
+                std::lock_guard<std::mutex> lk(impl_->rxMutex);
+                impl_->rxClosed = true;
+                impl_->rxCv.notify_all();
+            }
         });
     impl_->tcpDisconnect = impl_->tcp.onDisconnect.listen(
         [this](TcpDisconnectEventArgs& /*a*/) {
