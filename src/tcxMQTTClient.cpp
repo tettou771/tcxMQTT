@@ -325,7 +325,15 @@ void MQTTClient::Impl::yieldLoop() {
             rxBuf.clear();
         }
 
-        if (!autoReconnect) break;  // exit thread, stay disconnected
+        if (!autoReconnect) {
+            /* Mark the worker as no longer alive so a future connect()
+             * can spawn a fresh one. yieldRunning otherwise stays true
+             * (only disconnect() flips it externally) and connect()
+             * would think the worker is up while this thread has
+             * already returned. */
+            yieldRunning = false;
+            break;
+        }
 
         // --- reconnect loop: retry forever (or until disconnect() / autoReconnect=false) ---
         while (yieldRunning && autoReconnect && !connected) {
@@ -334,6 +342,8 @@ void MQTTClient::Impl::yieldLoop() {
             if (tryConnectInternal()) break;  // success -> back to outer loop
         }
     }
+    /* Final safety: whichever path we exit via, mark not alive. */
+    yieldRunning = false;
 }
 
 // Used both by MQTTClient::connect() (initial connect) and by yieldLoop()
@@ -513,8 +523,12 @@ bool MQTTClient::connect(const std::string& host, int port,
 
     if (!impl_->tryConnectInternal()) return false;
 
-    // Spawn the yield/reconnect worker exactly once.
+    // Spawn the yield/reconnect worker. If a previous run already exited
+    // (autoReconnect=false case where yieldLoop bails after disconnect)
+    // the thread object is still joinable — assigning a fresh std::thread
+    // over it would call terminate(). Join first, then replace.
     if (!impl_->yieldRunning) {
+        if (impl_->yieldThread.joinable()) impl_->yieldThread.join();
         impl_->yieldRunning = true;
         impl_->yieldThread = std::thread([this]() { impl_->yieldLoop(); });
     }
