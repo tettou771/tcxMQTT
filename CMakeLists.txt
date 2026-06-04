@@ -33,9 +33,13 @@ target_include_directories(tcxMQTT
 
 target_link_libraries(tcxMQTT PUBLIC TrussC)
 
-# lwmqtt is C99; silence common warnings (vendor code we don't own)
-set_source_files_properties(${LWMQTT_SOURCES} PROPERTIES
-    COMPILE_FLAGS "-Wno-unused-parameter -Wno-sign-compare"
-)
+# lwmqtt is C99; silence common warnings (vendor code we don't own).
+# These are GCC/Clang flag spellings — MSVC's cl.exe rejects them (D8021), so
+# only apply them on non-MSVC toolchains.
+if(NOT MSVC)
+    set_source_files_properties(${LWMQTT_SOURCES} PROPERTIES
+        COMPILE_FLAGS "-Wno-unused-parameter -Wno-sign-compare"
+    )
+endif()
 
 message(STATUS "[tcxMQTT] Addon loaded")
