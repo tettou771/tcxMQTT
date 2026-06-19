@@ -66,6 +66,29 @@ struct MQTTClient::Impl {
     std::thread yieldThread;
     std::atomic<bool> yieldRunning{false};
 
+    // ---- send worker -------------------------------------------------------
+    // publish() is moved off the caller's thread: it enqueues an OutMsg here
+    // and a dedicated send thread drains the queue serially, taking lwMutex
+    // around each lwmqtt_publish call. This unblocks render / pipeline
+    // threads — wire latency stalls on slow brokers / LTE no longer pin the
+    // caller. See sendLoop() for the drain. Bounded queue, drop-oldest on
+    // overflow (preview state is "last value wins"; old frames are stale).
+    struct OutMsg {
+        std::string topic;
+        std::vector<uint8_t> payload;
+        int  qos    = 0;
+        bool retain = false;
+    };
+    std::deque<OutMsg> sendQueue;
+    std::mutex sendMutex;
+    std::condition_variable sendCv;
+    std::thread sendThread;
+    std::atomic<bool> sendRunning{false};
+    static constexpr size_t SEND_QUEUE_MAX = 256;
+    // Throttle the overflow warning so a sustained burst doesn't spam logs.
+    int64_t lastOverflowLogMs = 0;
+    size_t  droppedSinceLastLog = 0;
+
     // ---- pending dispatches (yield thread -> update()) ---------------------
     // Events are notified from update() on the main thread to keep listener
     // bodies on the main thread (drawing-friendly).
@@ -134,6 +157,10 @@ struct MQTTClient::Impl {
     void enqueueError(std::string s);
     void wireTransport();        // (re)attach event listeners to tcp.
     void yieldLoop();
+    void sendLoop();             // drains sendQueue under lwMutex
+    void enqueuePublish(const std::string& topic,
+                        const uint8_t* data, size_t len,
+                        int qos, bool retain);
     bool tryConnectInternal();   // TCP + MQTT CONNECT using saved credentials
 };
 
@@ -532,10 +559,27 @@ bool MQTTClient::connect(const std::string& host, int port,
         impl_->yieldRunning = true;
         impl_->yieldThread = std::thread([this]() { impl_->yieldLoop(); });
     }
+    // Send worker — drains the publish queue off the caller's thread.
+    if (!impl_->sendRunning) {
+        if (impl_->sendThread.joinable()) impl_->sendThread.join();
+        impl_->sendRunning = true;
+        impl_->sendThread = std::thread([this]() { impl_->sendLoop(); });
+    }
     return true;
 }
 
 void MQTTClient::disconnect() {
+    // Stop the send worker first so no more lwmqtt_publish calls race the
+    // lwmqtt_disconnect below. Pending queued messages are dropped — caller
+    // already returned from publish(), and there's no graceful way to flush
+    // them once we're tearing the session down.
+    if (impl_->sendRunning) {
+        impl_->sendRunning = false;
+        impl_->sendCv.notify_all();
+        if (impl_->sendThread.joinable()) impl_->sendThread.join();
+        std::lock_guard<std::mutex> lk(impl_->sendMutex);
+        impl_->sendQueue.clear();
+    }
     if (impl_->yieldRunning) {
         impl_->yieldRunning = false;
         if (impl_->yieldThread.joinable()) impl_->yieldThread.join();
@@ -580,20 +624,105 @@ bool MQTTClient::publish(const std::string& topic, const std::string& payload,
                    payload.size(), qos, retain);
 }
 
+// Non-blocking: copies the payload into the send queue and returns. The
+// dedicated send thread (see sendLoop) drains the queue and performs the
+// actual lwmqtt_publish call. Pre-disconnect API behaviour preserved: a
+// publish issued while not connected still returns false. Once connected,
+// publish returns true as long as the message is queued — actual broker
+// delivery is observed via onError if the wire write fails.
 bool MQTTClient::publish(const std::string& topic,
                          const uint8_t* data, size_t len,
                          int qos, bool retain) {
     if (!impl_->connected) return false;
     if (qos < 0 || qos > 2) return false;
-    lwmqtt_string_t t = lwmqtt_string(topic.c_str());
-    lwmqtt_message_t m = lwmqtt_default_message;
-    m.qos      = (lwmqtt_qos_t)qos;
-    m.retained = retain;
-    m.payload  = const_cast<uint8_t*>(data);
-    m.payload_len = len;
-    lwmqtt_publish_options_t pubOpts = lwmqtt_default_publish_options;
-    std::lock_guard<std::mutex> lk(impl_->lwMutex);
-    return lwmqtt_publish(&impl_->lw, &pubOpts, t, m, 2000) == LWMQTT_SUCCESS;
+    impl_->enqueuePublish(topic, data, len, qos, retain);
+    return true;
+}
+
+// Enqueue a publish for the send worker. Bounded queue, drop-OLDEST on
+// overflow (preview-style "last value wins" producers benefit most). Caller
+// must NOT hold lwMutex.
+void MQTTClient::Impl::enqueuePublish(const std::string& topic,
+                                      const uint8_t* data, size_t len,
+                                      int qos, bool retain) {
+    OutMsg m;
+    m.topic   = topic;
+    m.payload.assign(data, data + len);
+    m.qos     = qos;
+    m.retain  = retain;
+    size_t dropped = 0;
+    size_t toLog   = 0;
+    bool   doLog   = false;
+    {
+        std::lock_guard<std::mutex> lk(sendMutex);
+        while (sendQueue.size() >= SEND_QUEUE_MAX) {
+            sendQueue.pop_front();
+            ++dropped;
+        }
+        sendQueue.push_back(std::move(m));
+        if (dropped > 0) {
+            droppedSinceLastLog += dropped;
+            int64_t now = nowMs();
+            if (now - lastOverflowLogMs > 1000) {
+                lastOverflowLogMs = now;
+                toLog = droppedSinceLastLog;
+                droppedSinceLastLog = 0;
+                doLog = true;
+            }
+        }
+    }
+    sendCv.notify_one();
+    // Log outside the lock — formatting + I/O shouldn't extend the critical
+    // section that publish() callers wait on.
+    if (doLog) {
+        logWarning("tcxMQTT") << "send queue overflow: dropped " << toLog
+                              << " oldest message(s) (queue cap "
+                              << SEND_QUEUE_MAX << ")";
+    }
+}
+
+// Send worker — single thread, the only place lwmqtt_publish runs from. Wakes
+// on sendCv when the queue grows or when shutting down. Holds lwMutex only
+// while inside the lwmqtt call so it cooperates with yieldLoop (which holds
+// the same mutex for its 200ms slice). When disconnected, drains and DROPS
+// queued messages so producers don't pile up — the contract is fire-and-
+// forget for QoS 0; QoS 1/2 in-flight bookkeeping happens inside lwmqtt and
+// the worker is allowed to block waiting for PUBACK without affecting the
+// caller.
+void MQTTClient::Impl::sendLoop() {
+    while (sendRunning) {
+        OutMsg m;
+        {
+            std::unique_lock<std::mutex> lk(sendMutex);
+            sendCv.wait(lk, [this] {
+                return !sendRunning || !sendQueue.empty();
+            });
+            if (!sendRunning && sendQueue.empty()) return;
+            if (sendQueue.empty()) continue;
+            m = std::move(sendQueue.front());
+            sendQueue.pop_front();
+        }
+        // Drop while disconnected — matches the old publish() pre-check
+        // semantics (return false then; here we silently discard since the
+        // caller already returned true). Same overflow policy applies.
+        if (!connected) continue;
+
+        lwmqtt_string_t t = lwmqtt_string(m.topic.c_str());
+        lwmqtt_message_t lm = lwmqtt_default_message;
+        lm.qos         = (lwmqtt_qos_t)m.qos;
+        lm.retained    = m.retain;
+        lm.payload     = m.payload.data();
+        lm.payload_len = m.payload.size();
+        lwmqtt_publish_options_t pubOpts = lwmqtt_default_publish_options;
+        lwmqtt_err_t e;
+        {
+            std::lock_guard<std::mutex> lk(lwMutex);
+            e = lwmqtt_publish(&lw, &pubOpts, t, lm, 2000);
+        }
+        if (e != LWMQTT_SUCCESS) {
+            enqueueError("lwmqtt_publish: " + std::to_string((int)e));
+        }
+    }
 }
 
 void MQTTClient::update() {

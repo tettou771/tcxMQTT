@@ -60,6 +60,18 @@ public:
     bool subscribe(const std::string& topic, int qos = 0);
     bool unsubscribe(const std::string& topic);
 
+    // Non-blocking: copies the payload into an internal send queue and
+    // returns. A dedicated send thread performs the actual MQTT publish on
+    // the wire, so callers are decoupled from broker / network latency.
+    //   - Returns true when the message is enqueued (or false if not
+    //     connected or qos is out of range).
+    //   - Returned-true does NOT guarantee broker delivery — wire errors
+    //     surface via onError. Suitable for fire-and-forget QoS 0; QoS 1/2
+    //     in-flight bookkeeping happens internally on the send thread.
+    //   - Queue is bounded (256 entries). On overflow the OLDEST queued
+    //     messages are dropped, with a throttled warning log. Preview-style
+    //     producers (last-value-wins) benefit; QoS 1/2 producers that need
+    //     guaranteed delivery should rate-limit themselves to wire speed.
     bool publish(const std::string& topic,
                  const std::string& payload,
                  int qos = 0, bool retain = false);
