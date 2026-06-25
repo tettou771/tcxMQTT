@@ -320,20 +320,19 @@ void MQTTClient::Impl::yieldLoop() {
         while (yieldRunning && sessionLive) {
             {
                 std::lock_guard<std::mutex> lk(lwMutex);
-                // 2000ms slice — bumped from 200ms empirically: with 200ms
-                // and a high-rate broker (>20Hz subscribed publishes) lwmqtt
-                // 3.x intermittently mis-counts a packet boundary and reads a
-                // mid-stream byte as a fresh packet header, returning -9
-                // (LWMQTT_MISSING_OR_WRONG_PACKET) every 25-35s and forcing
-                // the session to reconnect. The exact mechanism isn't pinned
-                // down (mid-packet partial reads never fire under
-                // instrumentation, yet bytes_consumed > drained bytes by a
-                // consistent margin), but a longer yield slice eliminates the
-                // recurrence: 71min × multiple sessions clean at 2000ms vs
-                // every ~30s at 200ms. Disconnect detection isn't impacted —
-                // rxClosed wakes the cv immediately, and the silent-receive
-                // watchdog in MQTTManager has a 5s warning / 15s recycle
-                // backstop.
+                // 2000ms slice (was 200ms). lwmqtt 3.x intermittently
+                // mis-counts packet boundaries under sustained subscribe
+                // load and rejects a mid-stream byte as a fresh header (-9
+                // every 25-35s at 200ms). Empirically: each rejection
+                // bookends a 2-byte drift between drained bytes and parsed
+                // bytes, but the path that drains 2 bytes without
+                // accounting hasn't been pinned down (mid-packet partial
+                // reads + drop_overflow both ruled out by instrumentation).
+                // 2000ms keeps the bug below threshold (no recurrence in
+                // multi-hour testing). Disconnect detection isn't impacted
+                // — rxClosed wakes the cv immediately, and the consumer-
+                // side watchdog in MQTTManager has a 5s warning / 15s
+                // forceReconnect backstop.
                 lwmqtt_err_t e = lwmqtt_yield(&lw, BUF, 2000);
                 if (e != LWMQTT_SUCCESS && e != LWMQTT_NETWORK_TIMEOUT) {
                     enqueueError("lwmqtt_yield: " + std::to_string((int)e));
