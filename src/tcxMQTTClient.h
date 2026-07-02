@@ -20,7 +20,7 @@
 
 namespace trussc { class TcpClient; }
 
-namespace tcx {
+namespace tcx::mqtt {
 
 class MQTTClient {
 public:
@@ -144,4 +144,14 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-} // namespace tcx
+} // namespace tcx::mqtt
+
+// -----------------------------------------------------------------------------
+// Backward compatibility. The canonical namespace is now `tcx::mqtt`. These
+// silent aliases keep older code compiling: flat `tcx::MQTTClient` and legacy
+// `trussc::MQTTClient`. DEPRECATED — removed in v1.0.0.
+// (No [[deprecated]] attribute: under the usual `using namespace tc;` it would
+//  warn on idiomatic unqualified use too. See tcxMQTT README for migration.)
+// -----------------------------------------------------------------------------
+namespace tcx    { using mqtt::MQTTClient; } // deprecated: remove at v1.0.0
+namespace trussc { using tcx::mqtt::MQTTClient; } // deprecated: remove at v1.0.0

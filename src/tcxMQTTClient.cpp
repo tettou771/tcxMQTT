@@ -23,7 +23,7 @@ extern "C" {
 
 using namespace ::trussc;
 
-namespace tcx {
+namespace tcx::mqtt {
 
 // =============================================================================
 // Pimpl
@@ -826,4 +826,4 @@ bool MQTTClient::setTransport(std::unique_ptr<TcpClient> transport) {
     return true;
 }
 
-} // namespace tcx
+} // namespace tcx::mqtt
